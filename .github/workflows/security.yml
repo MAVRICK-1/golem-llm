@@ -71,36 +71,40 @@ jobs:
         
     - name: 🏗️ Build WASM Components
       run: |
-        echo "🔨 Building all WASM components for security analysis..."
-        
-        # Build debug versions
-        echo "Building debug components..."
-        cargo make build-all
-        
-        # Build release versions  
-        echo "Building release components..."
-        cargo make release-build-all
-        
-        # Verify builds
-        echo "📊 Build verification:"
-        if [ -d "components/debug" ]; then
-          echo "Debug components: $(find components/debug -name "*.wasm" | wc -l)"
-          ls -la components/debug/
-        fi
-        
-        if [ -d "components/release" ]; then
-          echo "Release components: $(find components/release -name "*.wasm" | wc -l)"
-          ls -la components/release/
-        fi
+         run: |
+          echo "🔨 Building all WASM components for security analysis..."
+
+          # Ensure we're building for the correct target
+          rustup target add wasm32-wasip1
+
+          # Debug build
+          echo "Building debug components..."
+          cargo make build-all --profile development --env TARGET=wasm32-wasip1
+
+          # Release build
+          echo "Building release components..."
+          cargo make release-build-all --profile release --env TARGET=wasm32-wasip1
+
+          # Verify builds
+          echo "📊 Build verification:"
+          if [ -d "components/debug" ]; then
+            echo "Debug components: $(find components/debug -name "*.wasm" | wc -l)"
+            ls -lh components/debug/
+          fi
+
+          if [ -d "components/release" ]; then
+            echo "Release components: $(find components/release -name "*.wasm" | wc -l)"
+            ls -lh components/release/
+          fi
         
     - name: 🔍 WASM Security Analysis
       run: |
         echo "🔍 Starting comprehensive WASM security analysis..."
-        
+    
         # Make security script executable
         chmod +x scripts/security-analysis.sh
-        
-        # Run security analysis
+
+        # Run it
         ./scripts/security-analysis.sh
         
     - name: 🧪 Dependency Security Audit
