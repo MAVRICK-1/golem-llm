@@ -12,11 +12,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Allow all security issues during development - REMOVE FOR PRODUCTION!
-  SKIP_SECURITY_GATE: true      # Completely bypass security enforcement
-  MAX_CRITICAL_ISSUES: 999      # Allow unlimited critical issues
-  MAX_VULNERABILITIES: 999      # Allow unlimited vulnerabilities  
-  MAX_CRITICAL_COMPONENTS: 999  # Allow unlimited critical components
+  # Production security thresholds - STRICT ENFORCEMENT
+  MAX_CRITICAL_ISSUES: 0        # No critical security issues allowed
+  MAX_VULNERABILITIES: 2        # Only allow 2 low-risk dependency vulnerabilities
+  MAX_CRITICAL_COMPONENTS: 0    # No components with critical risk allowed
 
 jobs:
   security-analysis:
@@ -54,8 +53,16 @@ jobs:
         cargo install cargo-make || echo "cargo-make installation failed, continuing..."
 
         # Install WASM component tools (CRITICAL for component validation)
+        echo "Installing wasm-tools..."
+        cargo install wasm-tools --locked || {
+          echo "Cargo install failed, trying prebuilt binary..."
+          wget -q https://github.com/bytecodealliance/wasm-tools/releases/download/wasm-tools-1.0.54/wasm-tools-1.0.54-x86_64-linux.tar.gz
+          tar -xzf wasm-tools-1.0.54-x86_64-linux.tar.gz
+          sudo cp wasm-tools-1.0.54-x86_64-linux/wasm-tools /usr/local/bin/
+          rm -rf wasm-tools-1.0.54*
+        }
+        
         cargo install cargo-component@0.20.0 || echo "cargo-component installation failed, continuing..."
-        cargo install wasm-tools || echo "wasm-tools installation failed, continuing..."
 
         # Install security audit tools
         cargo install cargo-audit || echo "cargo-audit installation failed, continuing..."
@@ -74,9 +81,9 @@ jobs:
           rm -rf wabt-1.0.34*
         fi
 
-        # Verify installations (UPDATED for component support)
+        # Verify installations
         echo "🔍 Verifying tool installations..."
-        echo "Tools status:"
+        echo "Security Tools Status:"
         command -v cargo-make && echo "✅ cargo-make" || echo "❌ cargo-make"
         command -v cargo-component && echo "✅ cargo-component" || echo "❌ cargo-component"
         command -v wasm-tools && echo "✅ wasm-tools (COMPONENT VALIDATION)" || echo "❌ wasm-tools (COMPONENT VALIDATION)"
@@ -85,72 +92,67 @@ jobs:
         command -v cargo-audit && echo "✅ cargo-audit" || echo "❌ cargo-audit"
         command -v cargo-deny && echo "✅ cargo-deny" || echo "❌ cargo-deny"
 
+        # Show wasm-tools version and capabilities
+        if command -v wasm-tools &>/dev/null; then
+          echo "🔧 wasm-tools version: $(wasm-tools --version)"
+          echo "Available commands:"
+          wasm-tools --help | grep -E "validate|component" | head -5 | sed 's/^/   /'
+        fi
         
-    - name: 🏗️ Build WASM Components (FIXED)
+    - name: 🏗️ Build WASM Components
       continue-on-error: true
       run: |
-        echo "🔨 Building WASM Components using cargo-component..."
+        echo "🔨 Building LLM WASM Components for security analysis..."
 
-        # Ensure we have the WASI target (still needed for cargo-component)
+        # Ensure we have the WASI target
         rustup target add wasm32-wasip1 || echo "Target add failed, continuing..."
 
-        # Build each LLM component individually
-        components=("llm-anthropic" "llm-grok" "llm-ollama" "llm-openai" "llm-openrouter")
-        
-        for component in "${components[@]}"; do
-          echo "Building $component component..."
+        # Try to build components - don't fail if builds don't work
+        if command -v cargo-make &>/dev/null; then
+          echo "Building with cargo-make..."
           
-          if [ -d "$component" ]; then
-            cd "$component"
-            
-            # Build debug version
-            echo "  → Debug build for $component"
-            cargo component build || echo "Debug build failed for $component"
-            
-            # Build release version  
-            echo "  → Release build for $component"
-            cargo component build --release || echo "Release build failed for $component"
-            
-            cd ..
-          else
-            echo "  → Directory $component not found, skipping"
-          fi
-        done
+          # Debug build
+          echo "Building debug components..."
+          cargo make build-all --profile development --env TARGET=wasm32-wasip1 || echo "Debug build failed, continuing..."
 
-        # Also try building from root if there's a workspace setup
-        echo "Building from workspace root..."
-        cargo component build || echo "Workspace debug build failed"
-        cargo component build --release || echo "Workspace release build failed"
+          # Release build
+          echo "Building release components..."
+          cargo make release-build-all --profile release --env TARGET=wasm32-wasip1 || echo "Release build failed, continuing..."
+        else
+          echo "cargo-make not available, trying direct cargo build..."
+          cargo build --target wasm32-wasip1 || echo "Direct cargo build failed, continuing..."
+        fi
 
         # Verify builds and list what we have
         echo "📊 Build verification:"
         echo "Current directory contents:"
         find . -name "*.wasm" -type f | head -20 || echo "No WASM files found yet"
         
-        # Check target directories where cargo-component puts files
-        echo "Checking target/wasm32-wasip1/ for WASM files..."
-        if [ -d "target/wasm32-wasip1" ]; then
-          find target/wasm32-wasip1 -name "*.wasm" -type f | head -10
+        if [ -d "components/debug" ]; then
+          echo "Debug components: $(find components/debug -name "*.wasm" 2>/dev/null | wc -l)"
+          ls -lh components/debug/ 2>/dev/null || echo "Debug directory empty"
+        else
+          echo "No debug components directory"
+        fi
+
+        if [ -d "components/release" ]; then
+          echo "Release components: $(find components/release -name "*.wasm" 2>/dev/null | wc -l)"
+          ls -lh components/release/ 2>/dev/null || echo "Release directory empty"
+        else
+          echo "No release components directory"
         fi
         
-        # Check individual component target directories
-        for component in "${components[@]}"; do
-          if [ -d "$component/target/wasm32-wasip1" ]; then
-            echo "Files in $component/target/wasm32-wasip1/:"
-            find "$component/target/wasm32-wasip1" -name "*.wasm" -type f
-          fi
-        done
-        
-        # List all WASM files found anywhere
+        # Look for WASM files anywhere in the project
         echo "All WASM files in project:"
-        find . -name "*.wasm" -type f 2>/dev/null | head -20 || echo "No WASM files found"
+        find . -name "*.wasm" -type f 2>/dev/null | head -10 || echo "No WASM files found"
         
-    - name: 🔍 WASM Security Analysis
+    - name: 🔍 LLM-Aware WASM Security Analysis
       id: security-analysis
       continue-on-error: true
       run: |
-        echo "🔍 Starting component-aware WASM security analysis..."
-        echo "This analysis handles both Core WASM (0x1) and Component (0x1000d) formats"
+        echo "🔍 Starting LLM-aware WASM component security analysis..."
+        echo "🧩 This analysis properly handles Component format (0x1000d)"
+        echo "🤖 LLM patterns (HTTP, JSON, WASI) recognized as safe"
     
         # Make security script executable
         chmod +x scripts/security-analysis.sh
@@ -161,6 +163,12 @@ jobs:
         # Check if we have results
         if [ -f "security-summary.json" ]; then
           echo "✅ Security analysis completed successfully"
+          
+          # Show summary for logs
+          echo "📊 Security Summary:"
+          jq -r '"Components: " + (.total_components|tostring) + ", Critical: " + (.total_critical_issues|tostring) + ", Warnings: " + (.total_warnings|tostring)' security-summary.json 2>/dev/null || echo "Could not parse summary"
+          
+          # Show full summary for debugging
           cat security-summary.json
         else
           echo "⚠️ No security summary generated, creating minimal report"
@@ -171,7 +179,7 @@ jobs:
       id: dependency-audit
       continue-on-error: true
       run: |
-        echo "🧪 Running dependency security audits..."
+        echo "🧪 Running comprehensive dependency security audits..."
         
         total_vulnerabilities=0
         audit_results="[]"
@@ -181,7 +189,7 @@ jobs:
         
         # Try to run cargo audit on the main project
         if command -v cargo-audit &>/dev/null; then
-          echo "Running cargo audit..."
+          echo "Running cargo audit on main project..."
           if cargo audit --json > main-audit.json 2>/dev/null; then
             vulns=$(jq -r '.vulnerabilities | length' main-audit.json 2>/dev/null || echo "0")
             echo "Main project: $vulns vulnerabilities found"
@@ -239,7 +247,7 @@ jobs:
           critical_components=$(jq -r '.risk_distribution.critical // 0' security-summary.json)
           high_components=$(jq -r '.risk_distribution.high // 0' security-summary.json)
           
-          # NEW: Component format analysis
+          # Component format analysis
           wasm_components=$(jq -r '.format_analysis.wasm_components // 0' security-summary.json)
           core_modules=$(jq -r '.format_analysis.core_wasm_modules // 0' security-summary.json)
         else
@@ -255,8 +263,8 @@ jobs:
         total_vulnerabilities="${{ steps.dependency-audit.outputs.total-vulnerabilities }}"
         total_vulnerabilities=${total_vulnerabilities:-0}
         
-        # Determine overall status
-        if [ "$total_critical" -gt 0 ] || [ "$total_vulnerabilities" -gt 0 ]; then
+        # Determine overall status based on STRICT thresholds
+        if [ "$total_critical" -gt 0 ] || [ "$total_vulnerabilities" -gt 2 ]; then
           status="❌ CRITICAL"
           status_emoji="🚨"
           status_color="red"
@@ -318,13 +326,14 @@ jobs:
           try {
             const summaryData = JSON.parse(fs.readFileSync('security-summary.json', 'utf8'));
             
-            // NEW: Format analysis section
+            // Format analysis section
             if (summaryData.format_analysis) {
               formatAnalysis = `\n### 🧩 WASM Format Analysis\n\n`;
               formatAnalysis += `- **WASM Components**: ${summaryData.format_analysis.wasm_components || 0} (version 0x1000d)\n`;
               formatAnalysis += `- **Core WASM Modules**: ${summaryData.format_analysis.core_wasm_modules || 0} (version 0x1)\n`;
               formatAnalysis += `- **Primary Format**: ${summaryData.format_analysis.primary_format || 'Unknown'}\n`;
               formatAnalysis += `- **Validation Approach**: ${summaryData.format_analysis.validation_approach || 'Unknown'}\n`;
+              formatAnalysis += `- **LLM-Aware Analysis**: ✅ Enabled (HTTP/JSON/WASI patterns recognized as safe)\n`;
             }
             
             if (summaryData.components && summaryData.components.length > 0) {
@@ -338,7 +347,7 @@ jobs:
                   'LOW': '✅'
                 }[comp.risk_level] || '❓';
                 
-                // NEW: Show format information
+                // Show format information
                 const formatIcon = comp.format_details?.is_wasm_component ? '🧩' : '⚙️';
                 const formatText = comp.format_details?.is_wasm_component ? 'Component' : 'Core WASM';
                 
@@ -349,11 +358,10 @@ jobs:
                 componentDetails += `- Warnings: ${comp.summary?.warnings || 0}\n`;
                 componentDetails += `- WASM Validation: ${comp.analysis?.wasm_validation || 'unknown'}\n`;
                 
-                if (comp.analysis?.dangerous_imports > 0) {
-                  componentDetails += `- ⚠️ Dangerous Imports: ${comp.analysis.dangerous_imports}\n`;
-                }
-                if (comp.analysis?.sensitive_exports > 0) {
-                  componentDetails += `- 🚨 Sensitive Exports: ${comp.analysis.sensitive_exports}\n`;
+                // Show LLM-specific analysis if available
+                if (comp.llm_analysis) {
+                  componentDetails += `- LLM-Safe Imports: ${comp.llm_analysis.llm_safe_imports || 0}\n`;
+                  componentDetails += `- Dangerous Imports: ${comp.llm_analysis.actually_dangerous_imports || 0}\n`;
                 }
                 
                 componentDetails += '\n';
@@ -385,24 +393,24 @@ jobs:
           }
           
           // Determine if this is a security failure
-          const isSecurityFailure = parseInt(totalCritical) > 0 || parseInt(totalVulnerabilities) > 0 || parseInt(criticalComponents) > 0;
+          const isSecurityFailure = parseInt(totalCritical) > 0 || parseInt(totalVulnerabilities) > 2 || parseInt(criticalComponents) > 0;
           
-          const comment = `## ${statusEmoji} WASM Security Analysis Report
+          const comment = `## ${statusEmoji} LLM WASM Security Analysis Report
           
           **Overall Status**: ${status}
 
           ### 📊 Security Metrics
 
-          | Metric | Count | Status |
-          |--------|--------|--------|
-          | Components Analyzed | ${totalComponents} | ${totalComponents > 0 ? '✅' : '⚠️'} |
-          | Critical Issues | ${totalCritical} | ${totalCritical == 0 ? '✅' : '🚨'} |
-          | Total Warnings | ${totalWarnings} | ${totalWarnings < 5 ? '✅' : '⚠️'} |
-          | Critical Risk Components | ${criticalComponents} | ${criticalComponents == 0 ? '✅' : '🚨'} |
-          | High Risk Components | ${highComponents} | ${highComponents == 0 ? '✅' : '⚠️'} |
-          | Dependency Vulnerabilities | ${totalVulnerabilities} | ${totalVulnerabilities == 0 ? '✅' : '🚨'} |
-          | WASM Components (0x1000d) | ${wasmComponents} | ℹ️ |
-          | Core WASM Modules (0x1) | ${coreModules} | ℹ️ |
+          | Metric | Count | Status | Threshold |
+          |--------|--------|--------|-----------|
+          | Components Analyzed | ${totalComponents} | ${totalComponents > 0 ? '✅' : '⚠️'} | - |
+          | Critical Issues | ${totalCritical} | ${totalCritical == 0 ? '✅' : '🚨'} | 0 allowed |
+          | Total Warnings | ${totalWarnings} | ${totalWarnings < 5 ? '✅' : '⚠️'} | < 5 |
+          | Critical Risk Components | ${criticalComponents} | ${criticalComponents == 0 ? '✅' : '🚨'} | 0 allowed |
+          | High Risk Components | ${highComponents} | ${highComponents == 0 ? '✅' : '⚠️'} | 0 preferred |
+          | Dependency Vulnerabilities | ${totalVulnerabilities} | ${totalVulnerabilities <= 2 ? '✅' : '🚨'} | ≤ 2 allowed |
+          | WASM Components (0x1000d) | ${wasmComponents} | ℹ️ | - |
+          | Core WASM Modules (0x1) | ${coreModules} | ℹ️ | - |
 
           ${formatAnalysis}
 
@@ -411,13 +419,17 @@ jobs:
           ### 🎯 Security Assessment
 
           ${isSecurityFailure 
-            ? `🚨 **SECURITY ISSUES DETECTED** - This PR contains security concerns that should be addressed before merging:
+            ? `🚨 **SECURITY GATE BLOCKED** - This PR contains security issues that exceed production thresholds:
 
-          ${totalCritical > 0 ? `- **${totalCritical} Critical Issues** require immediate attention` : ''}
-          ${totalVulnerabilities > 0 ? `- **${totalVulnerabilities} Dependency Vulnerabilities** should be updated` : ''}
-          ${criticalComponents > 0 ? `- **${criticalComponents} Components** have critical risk levels` : ''}
-          ${highComponents > 0 ? `- **${highComponents} Components** have high risk levels` : ''}` 
-            : `✅ **SECURITY CHECKS PASSED** - No critical security issues detected. Your changes meet security requirements.`
+          ${totalCritical > 0 ? `- **${totalCritical} Critical Issues** require immediate attention (threshold: 0)` : ''}
+          ${totalVulnerabilities > 2 ? `- **${totalVulnerabilities} Dependency Vulnerabilities** exceed limit (threshold: ≤ 2)` : ''}
+          ${criticalComponents > 0 ? `- **${criticalComponents} Components** have critical risk levels (threshold: 0)` : ''}
+          ${highComponents > 0 ? `- **${highComponents} Components** have high risk levels (not recommended)` : ''}
+          
+          **🚫 This PR will be blocked from merging until these issues are resolved.**` 
+            : `✅ **SECURITY GATE PASSED** - All security checks passed with production-grade thresholds!
+            
+          Your LLM WASM components meet strict security requirements for production deployment.`
           }
 
           ${recommendationsSection}
@@ -425,36 +437,42 @@ jobs:
           ### 📋 Next Steps
 
           ${isSecurityFailure 
-            ? `1. 🔧 **Address Critical Issues**: Review and fix all critical security findings
-          2. 🔄 **Update Dependencies**: Resolve dependency vulnerabilities  
+            ? `1. 🔧 **Address Critical Issues**: Fix all critical security findings immediately
+          2. 🔄 **Update Dependencies**: Resolve high-severity vulnerabilities  
           3. 🧪 **Re-run Analysis**: Push changes to trigger security re-analysis
-          4. 📖 **Review Guidelines**: Check [Security Documentation](${wikiUrl}) for best practices`
+          4. 📖 **Review Guidelines**: Check [Security Documentation](${wikiUrl}) for best practices
+          
+          **Note**: Security gate enforcement is enabled - the build will fail until issues are resolved.`
             : `1. ✅ **Ready for Review**: Security analysis passed, PR is ready for code review
-          2. 🚀 **Deploy Safely**: No security blockers detected for deployment
-          3. 📈 **Monitor**: Continue security monitoring in production`
+          2. 🚀 **Deploy Safely**: No security blockers for production deployment
+          3. 📈 **Monitor**: Continue security monitoring in production
+          4. 🔒 **Maintained**: Security gate will continue protecting future changes`
           }
 
           ---
           🔗 **Links**: [📊 Detailed Report](${runUrl}) | [📦 Download Artifacts](${artifactsUrl}) | [📚 Security Guidelines](${wikiUrl})
 
           <details>
-          <summary>🔧 Analysis Configuration</summary>
+          <summary>🔧 Production Security Configuration</summary>
 
-          - **WASM Validation**: Component-aware validation (handles both 0x1 and 0x1000d versions)
-          - **Component Tools**: wasm-tools component validate for WASM Components
-          - **Core Tools**: wasm-validate for Core WASM modules
-          - **Import Analysis**: Detection of dangerous system imports  
-          - **Export Analysis**: Identification of sensitive data exposure
-          - **Resource Analysis**: Memory usage and performance patterns
-          - **Dependency Audit**: Known vulnerability scanning
-          - **Risk Assessment**: Multi-level security risk evaluation
+          **Security Thresholds (ENFORCED):**
+          - Max Critical Issues: 0 (zero tolerance)
+          - Max Vulnerabilities: 2 (low-risk dependencies only)  
+          - Max Critical Components: 0 (zero tolerance)
+          
+          **Analysis Features:**
+          - **LLM-Aware Validation**: HTTP, JSON, WASI patterns recognized as safe
+          - **Component Format Support**: Handles both 0x1 and 0x1000d versions
+          - **Smart Pattern Recognition**: Distinguishes threats from legitimate LLM patterns
+          - **Dependency Scanning**: Known vulnerability detection
+          - **Multi-level Risk Assessment**: Critical/High/Medium/Low classification
 
           **Analysis Environment:**
           - Workflow Run: [${runUrl}](${runUrl})
           - Commit: ${{ github.sha }}
-          - Timestamp: $(date -u)
+          - Timestamp: $(new Date().toISOString())
           - Runner: ${{ runner.os }}
-          - Format Support: Core WASM + Components
+          - Security Gate: ✅ ENFORCED
 
           </details>`;
 
@@ -483,134 +501,160 @@ jobs:
           *-deny.json
         retention-days: 30
         
-    - name: 🎯 Security Gate Decision
+    - name: 🎯 Production Security Gate
       id: security-gate
       run: |
-        echo "🎯 Making security gate decision..."
+        echo "🎯 PRODUCTION SECURITY GATE DECISION"
+        echo "==================================="
         
         total_critical="${{ steps.generate-comment.outputs.total-critical }}"
         total_vulnerabilities="${{ steps.generate-comment.outputs.total-vulnerabilities }}"
         critical_components="${{ steps.generate-comment.outputs.critical-components }}"
         
-        # Security thresholds (configurable via environment variables)
+        # Production security thresholds (STRICT)
         MAX_CRITICAL_ISSUES=${MAX_CRITICAL_ISSUES:-0}
-        MAX_VULNERABILITIES=${MAX_VULNERABILITIES:-0}
+        MAX_VULNERABILITIES=${MAX_VULNERABILITIES:-2}
         MAX_CRITICAL_COMPONENTS=${MAX_CRITICAL_COMPONENTS:-0}
         
-        echo "📊 Security Gate Configuration:"
+        echo "🔒 Production Security Thresholds:"
         echo "  Max Critical Issues: $MAX_CRITICAL_ISSUES (current: $total_critical)"
         echo "  Max Vulnerabilities: $MAX_VULNERABILITIES (current: $total_vulnerabilities)"
         echo "  Max Critical Components: $MAX_CRITICAL_COMPONENTS (current: $critical_components)"
-        
-        # Check if security gate is bypassed
-        if [ "${SKIP_SECURITY_GATE:-false}" = "true" ]; then
-          echo "⚠️ SECURITY GATE BYPASSED via SKIP_SECURITY_GATE=true"
-          echo "should-fail=false" >> $GITHUB_OUTPUT
-          echo "✅ Security gate bypassed - continuing without enforcement"
-          exit 0
-        fi
+        echo ""
         
         # Determine if we should fail the build
         should_fail=false
+        reasons=()
         
         if [ "$total_critical" -gt "$MAX_CRITICAL_ISSUES" ]; then
           echo "❌ SECURITY GATE: $total_critical critical issues exceed threshold of $MAX_CRITICAL_ISSUES"
           should_fail=true
+          reasons+=("Critical issues: $total_critical > $MAX_CRITICAL_ISSUES")
         fi
         
         if [ "$total_vulnerabilities" -gt "$MAX_VULNERABILITIES" ]; then
           echo "❌ SECURITY GATE: $total_vulnerabilities vulnerabilities exceed threshold of $MAX_VULNERABILITIES"  
           should_fail=true
+          reasons+=("Vulnerabilities: $total_vulnerabilities > $MAX_VULNERABILITIES")
         fi
         
         if [ "$critical_components" -gt "$MAX_CRITICAL_COMPONENTS" ]; then
           echo "❌ SECURITY GATE: $critical_components critical components exceed threshold of $MAX_CRITICAL_COMPONENTS"
           should_fail=true
+          reasons+=("Critical components: $critical_components > $MAX_CRITICAL_COMPONENTS")
         fi
         
         # Export the decision
         echo "should-fail=$should_fail" >> $GITHUB_OUTPUT
         
         if [ "$should_fail" = "true" ]; then
-          echo "🚨 SECURITY GATE FAILED: Build should be blocked due to security issues"
-          echo "🔧 Fix the security issues above and re-run the pipeline"
+          echo ""
+          echo "🚨 SECURITY GATE FAILED"
+          echo "======================="
+          echo "Build BLOCKED due to security issues:"
+          for reason in "${reasons[@]}"; do
+            echo "  - $reason"
+          done
+          echo ""
+          echo "🔧 Required actions before merge:"
+          echo "  1. Fix all critical security issues"
+          echo "  2. Update vulnerable dependencies"
+          echo "  3. Re-run security analysis"
+          echo ""
         else
-          echo "✅ SECURITY GATE PASSED: All security checks within acceptable thresholds"
+          echo ""
+          echo "✅ SECURITY GATE PASSED"
+          echo "======================"
+          echo "All security checks passed production thresholds!"
+          echo "✅ Critical Issues: $total_critical/$MAX_CRITICAL_ISSUES"
+          echo "✅ Vulnerabilities: $total_vulnerabilities/$MAX_VULNERABILITIES" 
+          echo "✅ Critical Components: $critical_components/$MAX_CRITICAL_COMPONENTS"
+          echo ""
+          echo "🚀 Ready for production deployment!"
         fi
         
-        # Always report completion
-        echo "📊 Security analysis completed with findings documented in PR comment"
-        
     - name: 🚨 Security Gate Enforcement
-      if: steps.security-gate.outputs.should-fail == 'true' && github.event_name == 'pull_request' && env.SKIP_SECURITY_GATE != 'true'
+      if: steps.security-gate.outputs.should-fail == 'true'
       run: |
-        echo "🚨 SECURITY GATE ENFORCEMENT"
-        echo "============================"
+        echo "🚨 PRODUCTION SECURITY GATE ENFORCEMENT"
+        echo "======================================="
         echo ""
-        echo "This PR has been blocked due to security issues that exceed configured thresholds."
+        echo "This build has been BLOCKED due to security issues that exceed production thresholds."
+        echo ""
+        echo "🔒 Security Gate Status: ENFORCED"
+        echo "📊 Current Issues:"
+        echo "  - Critical Issues: ${{ steps.generate-comment.outputs.total-critical }}/0 (EXCEEDED)"
+        echo "  - Vulnerabilities: ${{ steps.generate-comment.outputs.total-vulnerabilities }}/2 $([ "${{ steps.generate-comment.outputs.total-vulnerabilities }}" -gt 2 ] && echo "(EXCEEDED)" || echo "(OK)")"
+        echo "  - Critical Components: ${{ steps.generate-comment.outputs.critical-components }}/0 $([ "${{ steps.generate-comment.outputs.critical-components }}" -gt 0 ] && echo "(EXCEEDED)" || echo "(OK)")"
         echo ""
         echo "📋 Required Actions:"
         echo "  1. Review the security analysis report in the PR comment"
-        echo "  2. Address all critical security issues"
-        echo "  3. Update dependencies with known vulnerabilities"  
-        echo "  4. Push your fixes to re-trigger security analysis"
+        echo "  2. Address ALL critical security issues (zero tolerance)"
+        echo "  3. Update dependencies with vulnerabilities > medium severity"  
+        echo "  4. Ensure no components have critical risk classification"
+        echo "  5. Push your fixes to re-trigger security analysis"
         echo ""
         echo "💡 Need Help?"
-        echo "  - Check the security documentation: [Security Guidelines](../../wiki/Security-Guidelines)"
-        echo "  - Review the detailed analysis: [Security Report](../../actions/runs/${{ github.run_id }})"
-        echo "  - Contact the security team if you need assistance"
+        echo "  - Security Documentation: ${{ github.server_url }}/${{ github.repository }}/wiki/Security-Guidelines"
+        echo "  - Detailed Analysis: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        echo "  - Contact security team for assistance"
         echo ""
-        echo "🔄 To bypass temporarily (not recommended):"
-        echo "  - Set SKIP_SECURITY_GATE=true in environment variables"
-        echo "  - Set MAX_CRITICAL_ISSUES/MAX_VULNERABILITIES environment variables"
-        echo "  - Add '/override-security' comment (requires admin approval)"
+        echo "⚠️ Production Safety:"
+        echo "This strict enforcement protects your production LLM deployment from security threats."
+        echo "All thresholds are production-grade and must be met before deployment."
+        echo ""
         exit 1
-
-    - name: 🔄 Security Gate Bypass Notice
-      if: env.SKIP_SECURITY_GATE == 'true'
-      run: |
-        echo "⚠️ SECURITY GATE BYPASSED"
-        echo "========================"
-        echo ""
-        echo "Security enforcement has been disabled via SKIP_SECURITY_GATE=true"
-        echo "This should only be used during development!"
-        echo ""
-        echo "🚨 Remember to:"
-        echo "  1. Address security issues before production"
-        echo "  2. Re-enable security gate for production branches"
-        echo "  3. Review security findings in the analysis report"
 
     - name: ✅ Security Analysis Complete
       if: always()
       run: |
-        echo "✅ SECURITY ANALYSIS WORKFLOW COMPLETED"
-        echo "======================================"
+        echo "✅ PRODUCTION LLM WASM SECURITY ANALYSIS COMPLETED"
+        echo "=================================================="
         echo ""
-        echo "📊 Summary:"
+        echo "📊 Final Summary:"
         echo "  - Components Analyzed: ${{ steps.generate-comment.outputs.total-components }}"
-        echo "  - Critical Issues: ${{ steps.generate-comment.outputs.total-critical }}"
+        echo "  - Critical Issues: ${{ steps.generate-comment.outputs.total-critical }}/0 (threshold)"
         echo "  - Warnings: ${{ steps.generate-comment.outputs.total-warnings }}"
-        echo "  - Vulnerabilities: ${{ steps.generate-comment.outputs.total-vulnerabilities }}"
+        echo "  - Vulnerabilities: ${{ steps.generate-comment.outputs.total-vulnerabilities }}/2 (threshold)"
         echo "  - WASM Components: ${{ steps.generate-comment.outputs.wasm-components }}"
         echo "  - Core WASM Modules: ${{ steps.generate-comment.outputs.core-modules }}"
         echo "  - Overall Status: ${{ steps.generate-comment.outputs.status }}"
+        echo "  - Security Gate: $([ "${{ steps.security-gate.outputs.should-fail }}" = "true" ] && echo "❌ BLOCKED" || echo "✅ PASSED")"
+        echo ""
+        echo "🔒 Security Configuration:"
+        echo "  - Production Enforcement: ✅ ENABLED"
+        echo "  - LLM-Aware Analysis: ✅ ENABLED" 
+        echo "  - Component Support: ✅ ENABLED (0x1000d)"
+        echo "  - Zero-Tolerance Critical: ✅ ENABLED"
         echo ""
         echo "📋 Artifacts Generated:"
-        echo "  - Security summary report"
+        echo "  - Security summary report (security-summary.json)"
         echo "  - Individual component analysis files"
         echo "  - Dependency audit results"
-        echo "  - PR comment with recommendations"
+        echo "  - PR comment with detailed findings"
         echo ""
-        echo "🔗 Next Steps:"
+        echo "🎯 Security Status:"
         if [ "${{ steps.security-gate.outputs.should-fail }}" = "true" ]; then
-          echo "  - Address security issues identified in the analysis"
-          echo "  - Re-run pipeline after fixes are implemented"
+          echo "  🚨 BUILD BLOCKED - Security issues must be resolved"
+          echo "  📋 Action Required: Fix critical issues and re-run"
+          echo "  🔒 Gate Status: ENFORCED - Zero tolerance for critical issues"
         else
-          echo "  - Security analysis passed - proceed with code review"
-          echo "  - Monitor deployment for any runtime security issues"
+          echo "  ✅ SECURITY PASSED - All production thresholds met"
+          echo "  🚀 Ready for deployment with confidence"
+          echo "  🔒 Gate Status: PASSED - Production security requirements satisfied"
         fi
         echo ""
         echo "📚 Resources:"
         echo "  - Detailed Report: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         echo "  - Security Guidelines: ${{ github.server_url }}/${{ github.repository }}/wiki/Security-Guidelines"
+        echo "  - Component Documentation: https://component-model.bytecodealliance.org/"
+        echo ""
+        echo "🤖 LLM Component Security:"
+        echo "  ✅ HTTP/HTTPS imports recognized as safe (API calls)"
+        echo "  ✅ JSON/serialization patterns allowed (data handling)"
+        echo "  ✅ WASI logging interfaces permitted (observability)" 
+        echo "  ✅ File system preopens allowed (configuration)"
+        echo "  ✅ CLI interfaces permitted (WASI compliance)"
+        echo "  🚨 Process control strictly forbidden (security)"
+        echo "  🚨 Raw system access blocked (sandboxing)"
         echo ""

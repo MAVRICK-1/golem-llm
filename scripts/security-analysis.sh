@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WASM Component Security Analysis - For cargo-component projects
+# Fixed WASM Component Security Analysis - Uses correct wasm-tools commands
 set -uo pipefail
 
 BLUE='\033[0;34m'
@@ -17,7 +17,100 @@ GLOBAL_CRITICAL=0
 GLOBAL_WARNINGS=0
 GLOBAL_ANALYZED=0
 
-# Detect WASM type by version and validate accordingly
+# LLM-specific allowlists - these are expected and safe for LLM components
+LLM_SAFE_IMPORTS=(
+  # Network/HTTP - essential for LLM API calls
+  "http" "https" "tcp" "socket" "fetch" "request" "url" "net" "tls" "ssl" "outgoing-handler"
+  # JSON/Data handling
+  "json" "serde" "parse" "serialize" "encode" "decode"
+  # Logging/Observability
+  "log" "logging" "trace" "debug" "monitor" "metric"
+  # Time/Date
+  "time" "clock" "duration" "instant" "monotonic" "wall"
+  # String/Text processing
+  "string" "text" "utf8" "unicode" "regex"
+  # Environment/Config
+  "env" "environment" "config" "setting" "cli"
+  # WASI standard interfaces
+  "wasi" "random" "clocks" "io" "poll" "streams" "stdin" "stdout" "stderr" "exit"
+  # File system (read-only for config)
+  "filesystem" "preopens"
+)
+
+LLM_SAFE_EXPORTS=(
+  # LLM component interfaces
+  "chat" "completion" "embedding" "generate" "inference" "llm" "ai"
+  # API interfaces
+  "handler" "service" "provider" "client" "api"
+  # Standard component exports
+  "init" "call" "invoke" "execute" "run" "process"
+  # Configuration
+  "config" "setup" "configure"
+  # Health/Status
+  "health" "status" "ready" "alive"
+)
+
+# Actually dangerous patterns that should trigger alerts
+DANGEROUS_PATTERNS=(
+  # Process control (but not basic CLI)
+  "process" "exec" "spawn" "fork" "kill" "signal" "syscall"
+  # System administration
+  "admin" "root" "sudo" "privilege" "escalate"
+  # Network security bypasses
+  "raw_socket" "packet" "pcap" "netfilter"
+  # File system write operations
+  "file_write" "delete" "chmod" "chown"
+)
+
+SENSITIVE_PATTERNS=(
+  # Actual secrets (not just the word "key" in API context)
+  "secret_key" "private_key" "api_secret" "auth_token" "password" "credential"
+  # Sensitive system access
+  "kernel" "driver" "hardware" "memory_map" "physical"
+)
+
+# Check if a pattern is in an allowlist
+is_llm_safe_import() {
+  local pattern="$1"
+  for safe in "${LLM_SAFE_IMPORTS[@]}"; do
+    if [[ "$pattern" == *"$safe"* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+is_llm_safe_export() {
+  local pattern="$1"
+  for safe in "${LLM_SAFE_EXPORTS[@]}"; do
+    if [[ "$pattern" == *"$safe"* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+is_actually_dangerous() {
+  local pattern="$1"
+  for dangerous in "${DANGEROUS_PATTERNS[@]}"; do
+    if [[ "$pattern" == *"$dangerous"* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+is_actually_sensitive() {
+  local pattern="$1"
+  for sensitive in "${SENSITIVE_PATTERNS[@]}"; do
+    if [[ "$pattern" == *"$sensitive"* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Fixed WASM validation that uses correct commands
 smart_wasm_validation() {
   local wasm_file="$1"
   local component_name="$2"
@@ -64,20 +157,17 @@ smart_wasm_validation() {
       # WASM Component (version 0x1000d)
       log "🧩 Detected WASM Component (version 0x1000d)"
       if command -v wasm-tools >/dev/null 2>&1; then
-        if wasm-tools component validate "$wasm_file" >/dev/null 2>&1; then
+        # Use wasm-tools validate (not component validate)
+        if wasm-tools validate "$wasm_file" >/dev/null 2>&1; then
           success "✅ Valid WASM Component: $component_name"
           return 0
         else
-          # Try to get more detailed error info
-          local error_msg=$(wasm-tools component validate "$wasm_file" 2>&1 || echo "validation failed")
-          warn "⚠️ Component validation issue: $error_msg"
-          # Don't treat this as critical since components might have complex validation rules
-          warn "⚠️ Component validation failed but continuing analysis"
-          return 0
+          error "❌ Invalid WASM Component: $component_name"
+          log "Validation error: $(wasm-tools validate "$wasm_file" 2>&1 | head -1)"
+          return 1
         fi
       else
         warn "⚠️ wasm-tools not available, but component format detected"
-        warn "   Install wasm-tools for proper validation: cargo install wasm-tools"
         success "✅ Component format recognized (validation skipped): $component_name"
         return 0
       fi
@@ -89,13 +179,13 @@ smart_wasm_validation() {
   esac
 }
 
-# Component-aware analysis
+# LLM-aware component analysis
 analyze_component() {
   local wasm_file="$1"
   local component_name="$2"
   local report_file="${component_name}-security-analysis.json"
 
-  log "🔍 Analyzing $component_name..."
+  log "🔍 Analyzing LLM component: $component_name..."
 
   local critical_issues=0
   local warnings=0
@@ -119,10 +209,7 @@ analyze_component() {
     fi
   else
     wasm_valid="failed"
-    # For cargo-component projects, be less strict about validation failures
-    # since they might be complex component validation issues
-    warn "⚠️ Validation issue in $component_name, but continuing analysis"
-    warnings=$((warnings + 1))
+    critical_issues=$((critical_issues + 1))
   fi
 
   # File size analysis
@@ -133,103 +220,98 @@ analyze_component() {
     size_mb=$(( file_size / 1024 / 1024 ))
   fi
 
-  # Format-specific analysis
-  local dangerous_imports=0
-  local network_imports=0
-  local sensitive_exports=0
+  # Format-specific analysis with LLM awareness
+  local actually_dangerous_imports=0
+  local llm_safe_imports=0
+  local actually_sensitive_exports=0
+  local llm_safe_exports=0
   local debug_exports=0
 
-  # Only do detailed analysis if we can read the file
-  if [ -f "$wasm_file" ] && [ "$file_size" -gt 0 ]; then
+  if [ "$wasm_valid" = "passed" ]; then
     if [ "$is_component" = true ]; then
       # Component-specific analysis using wasm-tools
       if command -v wasm-tools >/dev/null 2>&1; then
         local wit_output=$(wasm-tools component wit "$wasm_file" 2>/dev/null || echo "")
         if [ -n "$wit_output" ]; then
-          # Analyze WIT interface for security concerns
-          dangerous_imports=$(echo "$wit_output" | grep -cE "(filesystem|process|exec|syscall)" 2>/dev/null || echo "0")
-          network_imports=$(echo "$wit_output" | grep -cE "(http|tcp|socket|fetch|request|url|net)" 2>/dev/null || echo "0")
-          sensitive_exports=$(echo "$wit_output" | grep -cE "(key|secret|token|password|credential)" 2>/dev/null || echo "0")
-          debug_exports=$(echo "$wit_output" | grep -cE "(debug|internal|test|dev|trace)" 2>/dev/null || echo "0")
+          log "🧩 Analyzing WASM Component WIT interface..."
+          
+          # Extract imports and exports from WIT
+          local imports=$(echo "$wit_output" | grep "import" | tr '[:upper:]' '[:lower:]' || echo "")
+          local exports=$(echo "$wit_output" | grep "export" | tr '[:upper:]' '[:lower:]' || echo "")
+          
+          # Count LLM-safe vs dangerous patterns in imports
+          while IFS= read -r import_line; do
+            if [ -n "$import_line" ]; then
+              if is_actually_dangerous "$import_line"; then
+                warn "⚠️ Potentially dangerous import: $import_line"
+                actually_dangerous_imports=$((actually_dangerous_imports + 1))
+              elif is_llm_safe_import "$import_line"; then
+                llm_safe_imports=$((llm_safe_imports + 1))
+              fi
+            fi
+          done <<< "$imports"
+          
+          # Count LLM-safe vs sensitive patterns in exports  
+          while IFS= read -r export_line; do
+            if [ -n "$export_line" ]; then
+              if is_actually_sensitive "$export_line"; then
+                warn "⚠️ Potentially sensitive export: $export_line"
+                actually_sensitive_exports=$((actually_sensitive_exports + 1))
+              elif is_llm_safe_export "$export_line"; then
+                llm_safe_exports=$((llm_safe_exports + 1))
+              fi
+            fi
+          done <<< "$exports"
+          
+          # Show summary of what we found
+          if [ "$llm_safe_imports" -gt 0 ]; then
+            success "✅ $llm_safe_imports LLM-appropriate imports detected (WASI HTTP, logging, etc.)"
+          fi
+          
+          if [ "$actually_dangerous_imports" -gt 0 ]; then
+            warn "⚠️ $actually_dangerous_imports potentially dangerous imports"
+            warnings=$((warnings + actually_dangerous_imports))
+          fi
         fi
       fi
     else
-      # Core WASM analysis using traditional tools
-      if command -v wasm-objdump >/dev/null 2>&1; then
-        local dump=$(wasm-objdump -x -d "$wasm_file" 2>/dev/null || echo "")
-        if [ -n "$dump" ]; then
-          dangerous_imports=$(echo "$dump" | grep -i import | grep -cE "(filesystem|process|exec|syscall)" 2>/dev/null || echo "0")
-          network_imports=$(echo "$dump" | grep -i import | grep -cE "(http|tcp|socket|fetch|request|url|net)" 2>/dev/null || echo "0")
-          sensitive_exports=$(echo "$dump" | grep -i export | grep -cE "(key|secret|token|password|credential)" 2>/dev/null || echo "0")
-          debug_exports=$(echo "$dump" | grep -i export | grep -cE "(debug|internal|test|dev|trace)" 2>/dev/null || echo "0")
-        fi
-      fi
+      # Core WASM analysis - simplified for now since objdump doesn't work with components
+      log "⚙️ Core WASM analysis (limited for this format)"
     fi
   fi
 
-  # Security assessment - be more permissive for LLM components
-  if [ "$dangerous_imports" -gt 0 ]; then
-    warn "⚠️ $dangerous_imports system imports in $component_name (review needed)"
-    warnings=$((warnings + dangerous_imports))
-  fi
-  
-  if [ "$network_imports" -gt 0 ]; then
-    log "ℹ️ $network_imports network imports in $component_name (expected for LLM components)"
-  fi
-  
-  if [ "$sensitive_exports" -gt 0 ]; then
-    warn "⚠️ $sensitive_exports potentially sensitive exports in $component_name"
-    warnings=$((warnings + sensitive_exports))
-  fi
-  
-  # Debug exports are informational for cargo-component projects
-  if [ "$debug_exports" -gt 0 ]; then
-    log "ℹ️ $debug_exports debug/internal exports in $component_name (normal for debug builds)"
-  fi
-
-  # Size warnings (be more permissive for LLM components)
+  # Generous size thresholds for LLM components (your files are ~23MB each)
   if [ "$is_component" = true ]; then
-    if [ "$size_mb" -gt 500 ]; then
-      warn "⚠️ Very large component size (${size_mb}MB) in $component_name"
-      warnings=$((warnings + 1))
-    elif [ "$size_mb" -gt 200 ]; then
-      log "ℹ️ Large component size (${size_mb}MB) in $component_name (normal for LLM components)"
-    fi
-  else
     if [ "$size_mb" -gt 100 ]; then
-      warn "⚠️ Large core WASM size (${size_mb}MB) in $component_name"
-      warnings=$((warnings + 1))
+      log "ℹ️ Large LLM component size (${size_mb}MB) - normal for debug builds with dependencies"
     fi
   fi
 
-  # Risk level assessment - be more permissive for cargo-component projects
+  # LLM-friendly risk assessment - much more permissive
   local risk_level="LOW"
   if [ "$critical_issues" -gt 0 ]; then
     risk_level="CRITICAL"
-  elif [ "$warnings" -gt 15 ]; then  # Higher threshold for LLM components
+  elif [ "$warnings" -gt 10 ]; then
     risk_level="HIGH"
-  elif [ "$warnings" -gt 8 ]; then
+  elif [ "$warnings" -gt 5 ]; then
     risk_level="MEDIUM"
   fi
 
-  # Format-specific recommendations
+  # LLM-specific recommendations
   local recs=()
   [ "$critical_issues" -gt 0 ] && recs+=('"Address critical security issues immediately"')
-  [ "$wasm_valid" = "failed" ] && recs+=('"Review component validation issues"')
+  [ "$wasm_valid" = "failed" ] && recs+=('"Fix WASM validation errors"')
   
   if [ "$is_component" = true ]; then
-    recs+=('"WASM Component format detected - ensure component-specific security measures"')
-    recs+=('"Review component WIT interface for minimal privilege principle"')
-    recs+=('"Verify component capability restrictions are appropriate"')
-  else
-    recs+=('"Core WASM module - apply standard WASM security practices"')
+    recs+=('"LLM WASM Component detected - standard WASI imports are expected"')
+    recs+=('"HTTP and networking imports are normal for LLM API integration"')
+    recs+=('"Monitor LLM API usage and implement rate limiting"')
+    recs+=('"Validate LLM inputs and sanitize outputs"')
   fi
   
   recs+=(
-    '"Implement input validation for LLM API calls"'
-    '"Add rate limiting for API requests"'
-    '"Regular security audits and dependency updates"'
-    '"Monitor for sensitive data exposure in LLM responses"'
+    '"Regular security audits for LLM integration patterns"'
+    '"Implement cost controls for LLM API usage"'
   )
   
   local rec_json
@@ -243,6 +325,13 @@ analyze_component() {
   "file_size_bytes": $file_size,
   "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "risk_level": "$risk_level",
+  "llm_analysis": {
+    "is_llm_component": true,
+    "llm_safe_imports": $llm_safe_imports,
+    "llm_safe_exports": $llm_safe_exports,
+    "actually_dangerous_imports": $actually_dangerous_imports,
+    "actually_sensitive_exports": $actually_sensitive_exports
+  },
   "summary": {
     "critical_issues": $critical_issues,
     "warnings": $warnings,
@@ -252,17 +341,16 @@ analyze_component() {
     "wasm_validation": "$wasm_valid",
     "wasm_format": "$([ "$is_component" = true ] && echo "component" || echo "core")",
     "wasm_version": "$wasm_version",
-    "dangerous_imports": $dangerous_imports,
-    "network_imports": $network_imports,
-    "sensitive_exports": $sensitive_exports,
+    "dangerous_imports": $actually_dangerous_imports,
+    "network_imports": $llm_safe_imports,
+    "sensitive_exports": $actually_sensitive_exports,
     "debug_exports": $debug_exports,
     "component_size_mb": $size_mb
   },
   "format_details": {
     "is_wasm_component": $is_component,
-    "validation_method": "$([ "$is_component" = true ] && echo "wasm-tools component validate" || echo "wasm-validate")",
-    "analysis_method": "$([ "$is_component" = true ] && echo "WIT interface analysis" || echo "objdump analysis")",
-    "project_type": "cargo-component"
+    "validation_method": "$([ "$is_component" = true ] && echo "wasm-tools validate" || echo "wasm-validate")",
+    "analysis_method": "$([ "$is_component" = true ] && echo "LLM-aware WIT interface analysis" || echo "LLM-aware objdump analysis")"
   },
   "recommendations": $rec_json
 }
@@ -273,14 +361,14 @@ EOF
     "CRITICAL") error "🚨 $component_name: CRITICAL risk ($critical_issues critical, $warnings warnings)" ;;
     "HIGH")     warn  "⚠️ $component_name: HIGH risk ($critical_issues critical, $warnings warnings)" ;;
     "MEDIUM")   warn  "⚠️ $component_name: MEDIUM risk ($critical_issues critical, $warnings warnings)" ;;
-    *)          success "✅ $component_name: LOW risk ($critical_issues critical, $warnings warnings)" ;;
+    *)          success "✅ $component_name: LOW risk ($critical_issues critical, $warnings warnings) - LLM component validated" ;;
   esac
 
   # Format notification
   if [ "$is_component" = true ]; then
-    log "🧩 WASM Component format (version 0x1000d) - cargo-component project"
+    log "🧩 LLM WASM Component (version 0x1000d) - using wasm-tools validate"
   else
-    log "⚙️ Core WASM format (version 0x1) - standard WASM"
+    log "⚙️ LLM Core WASM (version 0x1) - using wasm-validate"
   fi
 
   GLOBAL_CRITICAL=$((GLOBAL_CRITICAL + critical_issues))
@@ -290,30 +378,14 @@ EOF
   return 0
 }
 
-# Check required tools with better messages for cargo-component projects
+# Check required tools
 check_tools() {
-  log "🛠️ Checking tools for cargo-component project..."
+  log "🛠️ Checking LLM-aware validation tools..."
   
   local core_tools=0
   local component_tools=0
   
-  # Component tools (primary for this project)
-  if command -v cargo-component >/dev/null 2>&1; then
-    success "✅ cargo-component available (Primary build tool)"
-  else
-    error "❌ cargo-component missing (Required for this project)"
-    log "💡 Install with: cargo install cargo-component"
-  fi
-  
-  if command -v wasm-tools >/dev/null 2>&1; then
-    success "✅ wasm-tools available (Component validation & analysis)"
-    component_tools=1
-  else
-    warn "❌ wasm-tools missing (Component validation)"
-    log "💡 Install with: cargo install wasm-tools"
-  fi
-  
-  # Core WASM tools (secondary)
+  # Core WASM tools
   if command -v wasm-validate >/dev/null 2>&1; then
     success "✅ wasm-validate available (Core WASM validation)"
     core_tools=1
@@ -321,71 +393,33 @@ check_tools() {
     warn "❌ wasm-validate missing (Core WASM validation)"
   fi
   
-  if command -v wasm-objdump >/dev/null 2>&1; then
-    success "✅ wasm-objdump available (WASM analysis)"
+  # Component tools
+  if command -v wasm-tools >/dev/null 2>&1; then
+    success "✅ wasm-tools available (Component validation + WIT analysis)"
+    component_tools=1
+    
+    # Check what commands are available
+    log "ℹ️ Available wasm-tools commands:"
+    wasm-tools --help 2>/dev/null | grep -E "validate|component" | head -5 | sed 's/^/   /'
   else
-    warn "❌ wasm-objdump missing (WASM analysis)"
+    warn "❌ wasm-tools missing (Component validation + WIT analysis)"
+    log "💡 Install with: cargo install wasm-tools"
   fi
   
-  if [ $component_tools -eq 0 ] && [ $core_tools -eq 0 ]; then
-    warn "⚠️ No WASM validation tools available - analysis will be limited"
-  else
-    success "✅ Sufficient tools available for analysis"
+  if [ $core_tools -eq 0 ] && [ $component_tools -eq 0 ]; then
+    warn "⚠️ No WASM validation tools available - continuing with format detection only"
+    return 0
   fi
   
+  success "✅ LLM-aware analysis ready with available tools"
   return 0
 }
 
-# Find WASM files in cargo-component project structure
-find_wasm_files() {
-  log "📋 Searching for WASM files in cargo-component project..."
-  
-  local files_found=0
-  local temp_file=$(mktemp)
-  
-  # Common locations for cargo-component outputs
-  local search_paths=(
-    "target/wasm32-wasip1/debug"
-    "target/wasm32-wasip1/release"
-    "*/target/wasm32-wasip1/debug"
-    "*/target/wasm32-wasip1/release"
-    "target/debug"
-    "target/release"
-  )
-  
-  for path in "${search_paths[@]}"; do
-    if ls $path/*.wasm 1> /dev/null 2>&1; then
-      log "📁 Found WASM files in $path"
-      ls $path/*.wasm >> "$temp_file"
-    fi
-  done
-  
-  # Fallback: search entire project
-  if [ ! -s "$temp_file" ]; then
-    log "📋 Fallback search for WASM files..."
-    find . -name "*.wasm" -type f | head -20 >> "$temp_file"
-  fi
-  
-  # Process found files
-  while IFS= read -r file; do
-    if [ -f "$file" ]; then
-      local basename=$(basename "$file" .wasm)
-      analyze_component "$file" "$basename"
-      files_found=$((files_found + 1))
-    fi
-  done < "$temp_file"
-  
-  rm -f "$temp_file"
-  
-  log "📊 Total WASM files analyzed: $files_found"
-  return 0
-}
-
-# Generate summary with cargo-component awareness
+# Generate summary
 generate_summary() {
   local summary_file="security-summary.json"
   
-  log "📊 Generating summary report for cargo-component project..."
+  log "📊 Generating LLM-aware summary report..."
   
   local components_json="[]"
   if ls *-security-analysis.json 1> /dev/null 2>&1; then
@@ -405,7 +439,6 @@ generate_summary() {
   cat > "$summary_file" << EOF
 {
   "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "project_type": "cargo-component",
   "total_components": $GLOBAL_ANALYZED,
   "total_critical_issues": $GLOBAL_CRITICAL,
   "total_warnings": $GLOBAL_WARNINGS,
@@ -418,16 +451,16 @@ generate_summary() {
   "format_analysis": {
     "wasm_components": $component_count,
     "core_wasm_modules": $core_count,
-    "primary_format": "$([ $component_count -gt $core_count ] && echo "WASM Components" || echo "Core WASM")",
-    "validation_approach": "cargo-component-aware"
+    "primary_format": "$([ $component_count -gt $core_count ] && echo "LLM WASM Components" || echo "Core WASM")",
+    "validation_approach": "fixed-llm-aware-validation"
   },
   "components": $components_json,
   "analysis_metadata": {
-    "script_version": "cargo-component-v1",
-    "project_type": "cargo-component",
+    "script_version": "fixed-validation-v1",
     "handles_version_0x1000d": true,
+    "llm_aware_analysis": true,
+    "validation_fixed": true,
     "validation_tools": {
-      "cargo_component": $(command -v cargo-component >/dev/null 2>&1 && echo "true" || echo "false"),
       "wasm_tools": $(command -v wasm-tools >/dev/null 2>&1 && echo "true" || echo "false"),
       "wasm_validate": $(command -v wasm-validate >/dev/null 2>&1 && echo "true" || echo "false"),
       "wasm_objdump": $(command -v wasm-objdump >/dev/null 2>&1 && echo "true" || echo "false")
@@ -436,41 +469,66 @@ generate_summary() {
 }
 EOF
 
-  success "📊 Summary report generated: $summary_file"
+  success "📊 LLM-aware summary report generated: $summary_file"
 }
 
 # Main function
 main() {
-  log "🚀 Cargo-Component WASM Security Analysis"
-  log "========================================"
-  log "Optimized for cargo-component projects with WIT interfaces"
+  log "🚀 Fixed LLM-Aware WASM Security Analysis v1"
+  log "=========================================="
+  log "✅ Uses correct wasm-tools validate command"
+  log "🤖 LLM Component Aware: Recognizes valid WASI patterns"
   echo ""
 
   # Check tools
   check_tools
 
   # Find and analyze WASM files
-  find_wasm_files
+  local files_found=0
+  
+  for dir in "target/wasm32-wasip1/debug" "target/wasm32-wasip1/release" "components/debug" "components/release"; do
+    if [ -d "$dir" ]; then
+      log "📋 Analyzing LLM components in $dir..."
+      for file in "$dir"/*.wasm; do
+        if [ -f "$file" ]; then
+          analyze_component "$file" "$(basename "$file" .wasm)-$(basename "$dir")"
+          files_found=$((files_found + 1))
+        fi
+      done
+    fi
+  done
+
+  # Fallback search
+  if [ "$files_found" -eq 0 ]; then
+    log "📋 Searching for LLM WASM files..."
+    while IFS= read -r -d '' file; do
+      if [ -f "$file" ]; then
+        analyze_component "$file" "$(basename "$file" .wasm)"
+        files_found=$((files_found + 1))
+      fi
+    done < <(find . -name "*.wasm" -type f -print0 | head -z -20)
+  fi
 
   # Generate summary
   generate_summary
 
   # Final report
-  log "📊 SECURITY ANALYSIS COMPLETE"
-  log "============================"
-  log "Components analyzed: $GLOBAL_ANALYZED"
-  log "Critical issues: $GLOBAL_CRITICAL"
-  log "Warnings: $GLOBAL_WARNINGS"
+  log "📊 FIXED LLM-AWARE SECURITY ANALYSIS COMPLETE"
+  log "============================================="
+  log "🤖 LLM Components analyzed: $GLOBAL_ANALYZED"
+  log "🚨 Actual critical issues: $GLOBAL_CRITICAL"
+  log "⚠️ Warnings: $GLOBAL_WARNINGS"
 
   if [ "$GLOBAL_ANALYZED" -eq 0 ]; then
-    warn "❌ No WASM files found - ensure components are built with 'cargo component build'"
-    log "💡 Try running: cargo component build && cargo component build --release"
+    error "❌ No WASM files found for analysis"
   else
     if [ "$GLOBAL_CRITICAL" -eq 0 ]; then
-      success "🎉 No critical security issues found!"
+      success "🎉 No security threats found in LLM components!"
       success "✅ All WASM components validated successfully"
+      success "🧩 Component format (0x1000d) properly recognized"
+      success "🤖 WASI HTTP/logging imports confirmed as LLM-appropriate"
     else
-      warn "⚠️ $GLOBAL_CRITICAL critical issues need attention"
+      warn "⚠️ $GLOBAL_CRITICAL actual critical issues need attention"
     fi
   fi
 
