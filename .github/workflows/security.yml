@@ -86,52 +86,64 @@ jobs:
         command -v cargo-deny && echo "✅ cargo-deny" || echo "❌ cargo-deny"
 
         
-    - name: 🏗️ Build WASM Components
+    - name: 🏗️ Build WASM Components (FIXED)
       continue-on-error: true
       run: |
-        echo "🔨 Building all WASM components for security analysis..."
+        echo "🔨 Building WASM Components using cargo-component..."
 
-        # Ensure we're building for the correct target
+        # Ensure we have the WASI target (still needed for cargo-component)
         rustup target add wasm32-wasip1 || echo "Target add failed, continuing..."
 
-        # Try to build components - don't fail if builds don't work
-        if command -v cargo-make &>/dev/null; then
-          echo "Building with cargo-make..."
+        # Build each LLM component individually
+        components=("llm-anthropic" "llm-grok" "llm-ollama" "llm-openai" "llm-openrouter")
+        
+        for component in "${components[@]}"; do
+          echo "Building $component component..."
           
-          # Debug build
-          echo "Building debug components..."
-          cargo make build-all --profile development --env TARGET=wasm32-wasip1 || echo "Debug build failed, continuing..."
+          if [ -d "$component" ]; then
+            cd "$component"
+            
+            # Build debug version
+            echo "  → Debug build for $component"
+            cargo component build || echo "Debug build failed for $component"
+            
+            # Build release version  
+            echo "  → Release build for $component"
+            cargo component build --release || echo "Release build failed for $component"
+            
+            cd ..
+          else
+            echo "  → Directory $component not found, skipping"
+          fi
+        done
 
-          # Release build
-          echo "Building release components..."
-          cargo make release-build-all --profile release --env TARGET=wasm32-wasip1 || echo "Release build failed, continuing..."
-        else
-          echo "cargo-make not available, trying direct cargo build..."
-          cargo build --target wasm32-wasip1 || echo "Direct cargo build failed, continuing..."
-        fi
+        # Also try building from root if there's a workspace setup
+        echo "Building from workspace root..."
+        cargo component build || echo "Workspace debug build failed"
+        cargo component build --release || echo "Workspace release build failed"
 
         # Verify builds and list what we have
         echo "📊 Build verification:"
         echo "Current directory contents:"
         find . -name "*.wasm" -type f | head -20 || echo "No WASM files found yet"
         
-        if [ -d "components/debug" ]; then
-          echo "Debug components: $(find components/debug -name "*.wasm" 2>/dev/null | wc -l)"
-          ls -lh components/debug/ 2>/dev/null || echo "Debug directory empty"
-        else
-          echo "No debug components directory"
-        fi
-
-        if [ -d "components/release" ]; then
-          echo "Release components: $(find components/release -name "*.wasm" 2>/dev/null | wc -l)"
-          ls -lh components/release/ 2>/dev/null || echo "Release directory empty"
-        else
-          echo "No release components directory"
+        # Check target directories where cargo-component puts files
+        echo "Checking target/wasm32-wasip1/ for WASM files..."
+        if [ -d "target/wasm32-wasip1" ]; then
+          find target/wasm32-wasip1 -name "*.wasm" -type f | head -10
         fi
         
-        # Look for WASM files anywhere in the project
+        # Check individual component target directories
+        for component in "${components[@]}"; do
+          if [ -d "$component/target/wasm32-wasip1" ]; then
+            echo "Files in $component/target/wasm32-wasip1/:"
+            find "$component/target/wasm32-wasip1" -name "*.wasm" -type f
+          fi
+        done
+        
+        # List all WASM files found anywhere
         echo "All WASM files in project:"
-        find . -name "*.wasm" -type f 2>/dev/null | head -10 || echo "No WASM files found"
+        find . -name "*.wasm" -type f 2>/dev/null | head -20 || echo "No WASM files found"
         
     - name: 🔍 WASM Security Analysis
       id: security-analysis
