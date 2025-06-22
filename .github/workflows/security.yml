@@ -494,7 +494,8 @@ jobs:
         if [ "${SKIP_SECURITY_GATE:-false}" = "true" ]; then
           echo "⚠️ SECURITY GATE BYPASSED via SKIP_SECURITY_GATE=true"
           echo "should-fail=false" >> $GITHUB_OUTPUT
-          return 0
+          echo "✅ Security gate bypassed - continuing without enforcement"
+          exit 0
         fi
         
         # Determine if we should fail the build
