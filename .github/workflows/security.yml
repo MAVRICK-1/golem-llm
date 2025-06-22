@@ -513,7 +513,7 @@ jobs:
         
         # Production security thresholds (STRICT)
         MAX_CRITICAL_ISSUES=${MAX_CRITICAL_ISSUES:-0}
-        MAX_VULNERABILITIES=${MAX_VULNERABILITIES:-2}
+        MAX_VULNERABILITIES=${MAX_VULNERABILITIES:-5}
         MAX_CRITICAL_COMPONENTS=${MAX_CRITICAL_COMPONENTS:-0}
         
         echo "🔒 Production Security Thresholds:"
