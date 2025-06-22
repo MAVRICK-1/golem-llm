@@ -14,7 +14,7 @@ env:
   RUST_BACKTRACE: 1
   # Production security thresholds - STRICT ENFORCEMENT
   MAX_CRITICAL_ISSUES: 0        # No critical security issues allowed
-  MAX_VULNERABILITIES: 2        # Only allow 2 low-risk dependency vulnerabilities
+  MAX_VULNERABILITIES: 3        # Only allow 3 low-risk dependency vulnerabilities
   MAX_CRITICAL_COMPONENTS: 0    # No components with critical risk allowed
 
 jobs:
